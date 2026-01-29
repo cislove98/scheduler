@@ -24,13 +24,17 @@ OR-Tools CP-SAT 솔버 사용
 # ============================================================
 from __future__ import annotations
 
-from typing import List, Dict, Tuple, Optional, Any, cast
+import logging
+from typing import Any, cast
 from dataclasses import dataclass
 from enum import IntEnum
 from datetime import datetime
 
 import holidays
 from ortools.sat.python import cp_model
+
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
 __all__ = ["ScheduleConfig", "ScheduleModel"]
 
@@ -89,15 +93,16 @@ class ScheduleConfig:
 class ScheduleModel:
     """근무표 스케줄링 모델"""
 
-    def __init__(self, start_date: str, num_nurses: int, config: ScheduleConfig):
+    def __init__(self, start_date: str, nurses: list[str], config: ScheduleConfig):
         """
         Args:
             start_date: 시작 날짜(YYYYMMDD)
-            num_nurses: 간호사 수
+            nurses: 간호사 명단
             config: 스케줄 설정
         """
         self.start_date = datetime.strptime(start_date, "%Y%m%d")
-        self.num_nurses = num_nurses
+        self.nurses = nurses
+        self.num_nurses = len(self.nurses)
         self.config = config
         self.model: Any = cast(Any, cp_model.CpModel())
 
@@ -112,7 +117,7 @@ class ScheduleModel:
         self.forbidden_assignments = {}
         self.is_night = {}  # nurse -> [day별 N 여부] (N 블록 균형 제약에서 재사용)
 
-    def create_variables(self):
+    def _create_variables(self):
         """의사결정 변수 생성"""
         # assignments[nurse][day]는 정수(IntVar)입니다.
         # 예: 0이면 D, 1이면 E, 2이면 N, 3이면 O, 4이면 WR ...
@@ -126,7 +131,14 @@ class ScheduleModel:
                     0, len(ShiftType) - 1, f"nurse_{nurse}_day_{day}"
                 )
 
-    def add_hard_constraints(self):
+    def initialize_model(self, weekly_rest_days: dict[int, int]):
+        """모델 초기화"""
+        logger.info("Model initializing...")
+        self._create_variables()
+        self._set_weekly_rest_days(weekly_rest_days)
+        self._add_hard_constraints()
+
+    def _add_hard_constraints(self):
         """하드 제약조건 추가
 
         주의: 주휴 설정(set_weekly_rest_days)은 이 메서드 호출 전에 먼저 수행되어야 합니다.
@@ -626,7 +638,7 @@ class ScheduleModel:
                 # 휴무 최소 1개 필수
                 self.model.Add(sum(off_count) >= 1)
 
-    def set_weekly_rest_days(self, weekly_rest_days: Dict[int, int]):
+    def _set_weekly_rest_days(self, weekly_rest_days: dict[int, int]):
         """
         H-07: 주휴 고정
         간호사별 주휴 요일 설정 (최우선 조건 - 반드시 먼저 호출되어야 함)
@@ -727,7 +739,7 @@ class ScheduleModel:
                     ).OnlyEnforceIf(is_work.Not())
                     self.model.AddImplication(is_work.Not(), is_o)
 
-    def add_forbidden_assignments(self, forbidden: List[Tuple[int, int, ShiftType]]):
+    def add_forbidden_assignments(self, forbidden: list[tuple[int, int, ShiftType]]):
         """
         지정 근무 불가 제약 추가 (H-06)
 
@@ -739,13 +751,14 @@ class ScheduleModel:
 
     def solve(
         self, time_limit_seconds: int = 30
-    ) -> Optional[Dict[int, Dict[int, ShiftType]]]:
+    ) -> dict[int, dict[int, ShiftType]] | None:
         """
         모델 풀이
 
         Returns:
             해가 있으면 {nurse: {day: shift_type}} 딕셔너리, 없으면 None
         """
+        logger.info("Model solving...")
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = time_limit_seconds
 
