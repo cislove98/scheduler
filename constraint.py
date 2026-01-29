@@ -22,13 +22,20 @@ OR-Tools CP-SAT 솔버 사용
 # - 하드 제약: 가중치 개념 없음(무조건 만족해야 함)
 # - 소프트 제약: 아래 ScheduleConfig의 balance_* 값이 "얼마나 중요하게" 볼지 결정
 # ============================================================
+from __future__ import annotations
 
-from ortools.sat.python import cp_model
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any, cast
 from dataclasses import dataclass
 from enum import IntEnum
+from datetime import datetime
+
+import holidays
+from ortools.sat.python import cp_model
 
 __all__ = ["ScheduleConfig", "ScheduleModel"]
+
+
+holidays_kr = holidays.country_holidays("KR")
 
 
 class ShiftType(IntEnum):
@@ -40,7 +47,7 @@ class ShiftType(IntEnum):
     N = 2  # 나이트: 10pm-6am(+1)
 
     # 비근무
-    O = 3  # 휴무(OFF)
+    OFF = 3  # 휴무(OFF)
     WR = 4  # 주휴(Weekly Rest) - set_weekly_rest_days로 '고정'되는 날
     VAC = 5  # 휴가
     BIRTH_REST = 6  # 생휴
@@ -72,25 +79,27 @@ class ScheduleConfig:
     consecutive_rest_bonus: int = 2  # O와 WR 연속성 보너스 (낮은 가중치)
 
     def __init__(self, cycle_days: int):
-        # dataclass에 기본값이 있어도, __init__을 직접 정의하면
-        # 여기서 최소한 cycle_days는 반드시 세팅해줘야 합니다.
-        # 나머지 값은 "클래스 기본값"을 사용하게 됩니다.
-        # (필요하면 사용자가 config.balance_shift = 10 처럼 덮어쓸 수 있음)
+        """
+        Args:
+            cycle_days (int): 주기의 총 일수(28일)
+        """
         self.cycle_days = cycle_days
 
 
 class ScheduleModel:
     """근무표 스케줄링 모델"""
 
-    def __init__(self, num_nurses: int, config: ScheduleConfig = None):
+    def __init__(self, start_date: str, num_nurses: int, config: ScheduleConfig):
         """
         Args:
+            start_date: 시작 날짜(YYYYMMDD)
             num_nurses: 간호사 수
             config: 스케줄 설정
         """
+        self.start_date = datetime.strptime(start_date, "%Y%m%d")
         self.num_nurses = num_nurses
-        self.config = config or ScheduleConfig()
-        self.model = cp_model.CpModel()
+        self.config = config
+        self.model: Any = cast(Any, cp_model.CpModel())
 
         # 변수: assignments[nurse][day] = shift_type
         # 각 간호사의 각 날짜에 할당된 근무 유형
@@ -101,6 +110,7 @@ class ScheduleModel:
 
         # 지정 근무 불가 정보: (nurse, day, shift_type) -> bool
         self.forbidden_assignments = {}
+        self.is_night = {}  # nurse -> [day별 N 여부] (N 블록 균형 제약에서 재사용)
 
     def create_variables(self):
         """의사결정 변수 생성"""
@@ -208,7 +218,7 @@ class ScheduleModel:
         #
         # 이를 위해 is_night[day]라는 보조 Bool 변수를 만들어
         # "그날이 N인가?"를 0/1로 표현합니다.
-        self.is_night = {}  # nurse -> [day별 N 여부] (N 블록 균형 제약에서 재사용)
+        self.is_night = {}
         for nurse in range(self.num_nurses):
             # 각 날짜가 N인지 여부
             is_night = [
@@ -293,10 +303,10 @@ class ScheduleModel:
                         )
 
                         self.model.Add(
-                            self.assignments[nurse][rest_day_idx] == ShiftType.O
+                            self.assignments[nurse][rest_day_idx] == ShiftType.OFF
                         ).OnlyEnforceIf(is_off)
                         self.model.Add(
-                            self.assignments[nurse][rest_day_idx] != ShiftType.O
+                            self.assignments[nurse][rest_day_idx] != ShiftType.OFF
                         ).OnlyEnforceIf(is_off.Not())
 
                         self.model.Add(
@@ -443,10 +453,10 @@ class ScheduleModel:
                     self.assignments[nurse][day] != ShiftType.N
                 ).OnlyEnforceIf(is_n.Not())
                 self.model.Add(
-                    self.assignments[nurse][day] == ShiftType.O
+                    self.assignments[nurse][day] == ShiftType.OFF
                 ).OnlyEnforceIf(is_o)
                 self.model.Add(
-                    self.assignments[nurse][day] != ShiftType.O
+                    self.assignments[nurse][day] != ShiftType.OFF
                 ).OnlyEnforceIf(is_o.Not())
                 self.model.Add(
                     self.assignments[nurse][day] == ShiftType.WR
@@ -455,7 +465,7 @@ class ScheduleModel:
                     self.assignments[nurse][day] != ShiftType.WR
                 ).OnlyEnforceIf(is_wr.Not())
 
-                is_non_work = self.model.NewBoolVar(f"obj_nonwork_n{nurse}_d{day}")
+                is_non_work = self.model.NewBoolVar(f"obj_non_work_n{nurse}_d{day}")
                 self.model.AddBoolOr([is_o, is_wr]).OnlyEnforceIf(is_non_work)
                 self.model.AddBoolAnd([is_o.Not(), is_wr.Not()]).OnlyEnforceIf(
                     is_non_work.Not()
@@ -519,7 +529,6 @@ class ScheduleModel:
 
             # 연속성 점수 (최대화하려면 페널티에서 빼기 = 보너스)
             consecutive_score = sum(consecutive_bonus)
-            # YLW Modified : end
 
             penalty_terms.append(
                 w_shift * (dev_d + dev_e + dev_n)
@@ -569,12 +578,6 @@ class ScheduleModel:
                 # E AND D_next는 동시에 True가 될 수 없음
                 self.model.AddBoolOr([is_e.Not(), is_d_next.Not()])
 
-    def _add_weekly_rest_constraint(self):
-        """H-07: 주휴 먼저 고정"""
-        # 주휴는 나중에 설정할 수 있도록 메서드만 정의
-        # 실제 주휴 설정은 set_weekly_rest_days() 메서드로 수행
-        pass
-
     def _add_weekly_rest_and_off_constraint(self):
         """7일마다 최소 O(휴무) 1개, WR(주휴) 1개 필수"""
         # 각 간호사에 대해 "매 7일(1주)" 안에
@@ -610,10 +613,10 @@ class ScheduleModel:
                         f"is_off_nurse_{nurse}_week_{week}_day_{day}"
                     )
                     self.model.Add(
-                        self.assignments[nurse][day] == ShiftType.O
+                        self.assignments[nurse][day] == ShiftType.OFF
                     ).OnlyEnforceIf(is_off)
                     self.model.Add(
-                        self.assignments[nurse][day] != ShiftType.O
+                        self.assignments[nurse][day] != ShiftType.OFF
                     ).OnlyEnforceIf(is_off.Not())
                     off_count.append(is_off)
 
@@ -625,6 +628,7 @@ class ScheduleModel:
 
     def set_weekly_rest_days(self, weekly_rest_days: Dict[int, int]):
         """
+        H-07: 주휴 고정
         간호사별 주휴 요일 설정 (최우선 조건 - 반드시 먼저 호출되어야 함)
 
         주휴는 고정되며 다른 제약보다 우선 적용됩니다.
@@ -702,10 +706,10 @@ class ScheduleModel:
                     ).OnlyEnforceIf(is_n.Not())
 
                     self.model.Add(
-                        self.assignments[nurse][day] == ShiftType.O
+                        self.assignments[nurse][day] == ShiftType.OFF
                     ).OnlyEnforceIf(is_o)
                     self.model.Add(
-                        self.assignments[nurse][day] != ShiftType.O
+                        self.assignments[nurse][day] != ShiftType.OFF
                     ).OnlyEnforceIf(is_o.Not())
 
                     # WR은 불가 (주휴가 아닌 날이므로)
