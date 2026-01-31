@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timedelta
 import pandas as pd
 
-from constraint import ScheduleConfig, ShiftType
+from constraint import ShiftType
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -30,15 +30,15 @@ def get_solution_df(
     solution: dict[int, dict[int, ShiftType]],
     nurses: list[str],
     start_date: str,
-    config: ScheduleConfig,
+    cycle_days: int = 28,
 ):  # -> pd.DataFrame | None:
     """Get a solution DataFrame from a solution dictionary.
 
     Args:
         solution (dict[int, dict[int, ShiftType]]): A dictionary of solution.
-        num_nurses (int): The number of nurses.
+        nurses (list[str]): The list of nurses.
         start_date (str): The start date.
-        config (ScheduleConfig): The configuration of the schedule.
+        cycle_days (int): The number of days in the cycle.
 
     Raises:
         ValueError: If no solution is found.
@@ -49,26 +49,23 @@ def get_solution_df(
 
     date_obj = datetime.strptime(start_date, "%Y%m%d")
     date = [
-        (date_obj + timedelta(days=day)).strftime("%m/%d")
-        for day in range(config.cycle_days)
+        (date_obj + timedelta(days=day)).strftime("%m/%d") for day in range(cycle_days)
     ]
-    weekname = [
+    week_name = [
         WEEK_MAP.get((date_obj + timedelta(days=day)).strftime("%a"), "?")
-        for day in range(config.cycle_days)
+        for day in range(cycle_days)
     ]
 
     if solution:
         logger.info("Found a solution!")
-        # YLW Modified : start
         # 멀티 인덱스: 날짜와 요일을 함께 표시
         multi_index = pd.MultiIndex.from_arrays(
-            [date, weekname], names=["날짜", "요일"]
+            [date, week_name], names=["날짜", "요일"]
         )
-        # YLW Modified : end
         df = pd.DataFrame(
             {
                 f"{nurses[nurse]}": [
-                    solution[nurse][day].name for day in range(config.cycle_days)
+                    solution[nurse][day].name for day in range(cycle_days)
                 ]
                 for nurse in range(len(nurses))
             },
@@ -76,7 +73,6 @@ def get_solution_df(
         )
 
         if not df.empty and df is not None:
-            # YLW Modified : start
             # 날짜/요일을 컬럼으로, A,B,C...를 인덱스로 변환 (transpose)
             df_transposed = df.T
 
@@ -93,14 +89,8 @@ def get_solution_df(
             # 멀티 컬럼 레벨이 다르므로 concat 사용
             result = pd.concat([df_transposed, cnt], axis=1)
             return result
-            # YLW Modified : end
-        else:
-            raise ValueError(
-                "The solution DataFrame is empty. Please check the solution."
-            )
-    else:
-        msg = "No solution found. Please check the constraints."
-        raise ValueError(msg)
+        raise ValueError("The solution DataFrame is empty. Please check the solution.")
+    raise ValueError("No solution found. Please check the constraints.")
 
 
 def solution_to_excel(solution_dataframe: pd.DataFrame, filename: str) -> None:

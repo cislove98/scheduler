@@ -1,27 +1,11 @@
 """
-근무표 스케줄링을 위한 제약조건 프로그래밍 모델
-OR-Tools CP-SAT 솔버 사용
+간호사 근무표 자동 작성 모델 (OR-Tools CP-SAT 사용).
+
+- 각 날짜·간호사마다 D/E/N/OFF/주휴 등 하나의 근무유형을 고른다.
+- 반드시 지켜야 할 규칙(하드 제약)을 모두 만족하는 배치만 허용한다.
+- 그중에서 "되도록 지키면 좋은 규칙"(소프트 제약)을 점수로 쳐서, 점수가 가장 좋은 해를 고른다.
 """
 
-# ============================================================
-# 이 파일은 "간호사 근무표"를 자동으로 만드는 규칙(제약조건)을 정의합니다.
-#
-# 핵심 아이디어(비전공자용 요약)
-# - 우리는 각 간호사/각 날짜에 대해 "D/E/N/O/WR/..." 중 하나를 고릅니다.
-# - 그리고 "반드시 지켜야 하는 규칙(하드 제약)"을 모두 만족시키는 배치를 찾습니다.
-# - 하드 제약을 만족하는 해가 여러 개이면,
-#   "되도록 지키면 좋은 규칙(소프트 제약)"을 점수화해서 가장 점수가 좋은 해를 선택합니다.
-#
-# 용어
-# - D/E/N: Day/Evening/Night(근무)
-# - O: 휴무(OFF)
-# - WR: 주휴(Weekly Rest)  ← set_weekly_rest_days로 '고정'되는 날
-# - VAC/생휴/수면/법휴/공가 등: 비근무(확장 가능)
-#
-# 이 모델에서의 "가중치(weight)"
-# - 하드 제약: 가중치 개념 없음(무조건 만족해야 함)
-# - 소프트 제약: 아래 ScheduleConfig의 balance_* 값이 "얼마나 중요하게" 볼지 결정
-# ============================================================
 from __future__ import annotations
 
 import logging
@@ -30,8 +14,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from datetime import datetime, timedelta
 
-import holidays
 from ortools.sat.python import cp_model
+
 from kr_holidays import is_holiday
 
 logger = logging.getLogger(__name__)
@@ -40,161 +24,142 @@ logger.setLevel(logging.INFO)
 __all__ = ["ScheduleConfig", "ScheduleModel"]
 
 
-holidays_kr = holidays.country_holidays("KR")
-
-
 class ShiftType(IntEnum):
-    """근무 유형 정의"""
+    """그날 그 사람이 무엇인지 나타내는 유형 (한 날에 하나만 선택)."""
 
-    # 근무
-    D = 0  # 데이: 6am-2pm
-    E = 1  # 이브닝: 2pm-10pm
-    N = 2  # 나이트: 10pm-6am(+1)
-
-    # 비근무
-    OFF = 3  # 휴무(OFF)
-    WR = 4  # 주휴(Weekly Rest) - set_weekly_rest_days로 '고정'되는 날
+    D = 0  # 데이 (06~14시)
+    E = 1  # 이브닝 (14~22시)
+    N = 2  # 나이트 (22시~익일 06시)
+    OFF = 3  # 휴무
+    WR = 4  # 주휴 (요일 고정)
     VAC = 5  # 휴가
-    BIRTH_REST = 6  # 생휴
-    SLEEP = 7  # 수면
+    BR = 6  # 생휴
+    SL = 7  # 수면
     LH = 8  # 법휴
-    OL = 9  # 공가
+    OL = 9  # 공가 (사전 지정 비근무)
+    D1 = 10  # 사전 지정 근무 (정원에는 안 들어감)
 
 
 @dataclass
 class ScheduleConfig:
     """스케줄 설정"""
 
-    cycle_days: int  # 주기 일수
-    max_d_per_day: int = 2  # 일별 D 정원
-    max_e_per_day: int = 2  # 일별 E 정원
-    max_n_per_day: int = 2  # 일별 N 정원
-    # 실제로 “근무 배치가 되도록” 일별 필수 배치 인원(커버리지)을 둔다.
-    # 기본값은 정원과 동일하게 설정(=매일 D/E/N 각각 2명씩 배치).
-    required_d_per_day: int = 2
+    cycle_days: int
+    max_d_per_day: int = 2
+    max_e_per_day: int = 2
+    max_n_per_day: int = 2
+    required_d_per_day: int = 2  # 매일 D 몇 명 꼭
     required_e_per_day: int = 2
     required_n_per_day: int = 2
-    max_consecutive_work: int = 5  # 최대 연속 근무일
-    min_n_block: int = 2  # N 최소 연속일
-    max_n_block: int = 3  # N 최대 연속일
-    rest_after_n_block: int = 2  # N 블록 후 필수 휴무일
-    # 소프트 제약 가중치 (CP_constraint.md)
-    balance_shift: int = 5  # S-01: D/E/N 개수 균형
-    balance_off: int = 5  # S-02: 비근무일 개수 형평성
-    consecutive_rest_bonus: int = 2  # O와 WR 연속성 보너스 (낮은 가중치)
+    max_consecutive_work: int = 5  # 연속 근무 최대 5일
+    min_n_block: int = 2  # N은 2일 이상 연속
+    max_n_block: int = 3  # N은 3일 이하 연속
+    rest_after_n_block: int = 2  # N 블록 끝나고 휴무 2일
+    off_max_per_cycle: int = (
+        8  # 한 주기 동안 휴무(OFF) 상한. 하한 없음(주당 WR 1·OFF 1이 최소).
+    )
+    balance_shift: int = 5  # 소프트: D/E/N 골고루 (클수록 비중↑)
+    balance_off: int = 5  # 소프트: 휴무일 개수 형평
+    consecutive_rest_bonus: int = 2  # 소프트: 휴무/주휴 연속이면 보너스
 
-    def __init__(self, cycle_days: int):
-        """
-        Args:
-            cycle_days (int): 주기의 총 일수(28일)
-        """
+    def __init__(self, cycle_days: int = 28, off_max_per_cycle: int = 8):
         self.cycle_days = cycle_days
+        self.off_max_per_cycle = off_max_per_cycle
 
 
 class ScheduleModel:
-    """근무표 스케줄링 모델"""
+    """한 주기 근무표를 만드는 모델. 시작일·간호사 명단·설정을 받아 제약을 넣고 풀이한다."""
 
-    def __init__(self, start_date: str, nurses: list[str], config: ScheduleConfig):
-        """
-        Args:
-            start_date: 시작 날짜(YYYYMMDD)
-            nurses: 간호사 명단
-            config: 스케줄 설정
-        """
+    def __init__(
+        self,
+        start_date: str,
+        nurses: list[str],
+        config: ScheduleConfig,
+    ):
         self.start_date = datetime.strptime(start_date, "%Y%m%d")
         self.nurses = nurses
         self.num_nurses = len(self.nurses)
         self.config = config
         self.model: Any = cast(Any, cp_model.CpModel())
-
-        # 변수: assignments[nurse][day] = shift_type
-        # 각 간호사의 각 날짜에 할당된 근무 유형
-        self.assignments = {}
-
-        # 주휴 정보: nurse -> 주휴 요일 (0=일요일, 1=월요일, ..., 6=토요일)
-        self.weekly_rest_days = {}
-
-        # 지정 근무 불가 정보: (nurse, day, shift_type) -> bool
+        self.assignments = {}  # [간호사][날짜] → 그날 근무유형
+        self.weekly_rest_days = {}  # 간호사별 주휴 요일 (0=일 … 6=토)
+        self.official_leave_dates_set = set()  # (간호사, 날짜) 공가로 고정된 날
+        self.d1_dates_set = set()  # (간호사, 날짜) D1으로 고정된 날
         self.forbidden_assignments = {}
-        self.is_night = {}  # nurse -> [day별 N 여부] (N 블록 균형 제약에서 재사용)
+        self.is_night = {}  # N 블록 제약용: 그날 N인지 여부
+
+    def _day_index_from_date(self, date_str: str) -> int | None:
+        """'YYYY-MM-DD'를 주기 내 몇 번째 날(0부터)로 바꾼다. 주기 밖이면 None."""
+        try:
+            d = datetime.strptime(date_str.strip(), "%Y-%m-%d")
+        except ValueError:
+            return None
+        delta = (d.date() - self.start_date.date()).days
+        if 0 <= delta < self.config.cycle_days:
+            return delta
+        return None
 
     def _is_legal_holiday(self, day: int) -> bool:
-        """YLW Modified : start
-        해당 날짜가 법정 공휴일인지 확인
-
-        Args:
-            day: 주기 내 날짜 인덱스 (0부터 시작)
-
-        Returns:
-            True: 법정 공휴일, False: 법정 공휴일 아님
-        YLW Modified : end
-        """
+        """그날(주기 내 day)이 법정 공휴일인지 여부."""
         date = self.start_date + timedelta(days=day)
         date_str = date.strftime("%Y-%m-%d")
         return is_holiday(date_str)
 
     def _create_variables(self):
-        """의사결정 변수 생성"""
-        # assignments[nurse][day]는 정수(IntVar)입니다.
-        # 예: 0이면 D, 1이면 E, 2이면 N, 3이면 O, 4이면 WR ...
-        # 즉, "그날 그 간호사가 어떤 상태인지"를 하나의 값으로 표현합니다.
-        # 각 간호사와 각 날짜에 대해 근무 유형 할당 변수 생성
+        """각 (간호사, 날짜)마다 '그날 뭘 할지' 하나를 고르는 변수 만든다."""
         for nurse in range(self.num_nurses):
             self.assignments[nurse] = {}
             for day in range(self.config.cycle_days):
-                # 각 날짜에 할당 가능한 근무 유형 중 하나를 선택
                 self.assignments[nurse][day] = self.model.NewIntVar(
                     0, len(ShiftType) - 1, f"nurse_{nurse}_day_{day}"
                 )
 
-    def initialize_model(self, weekly_rest_days: dict[int, int]):
-        """모델 초기화"""
+    def initialize_model(
+        self,
+        weekly_rest_days: dict[int, int],
+        official_leave_days: dict[int, list[str]] | None = None,
+        d1_days: dict[int, list[str]] | None = None,
+    ):
+        """모델 초기화.
+
+        Args:
+            weekly_rest_days: {nurse_id: 요일(0~6)} 주휴 고정
+            official_leave_days: {nurse_id: ["YYYY-MM-DD", ...]} 공가 고정. WR과 동일 최우선.
+            d1_days: {nurse_id: ["YYYY-MM-DD", ...]} D1(사전 지정 근무) 고정. WR/OL과 동일 최우선.
+            fixed_d_days: {nurse_id: ["YYYY-MM-DD", ...]} 사용자 지정 D 고정. D1/OL/WR과 동일 최우선.
+            fixed_e_days: {nurse_id: ["YYYY-MM-DD", ...]} 사용자 지정 E 고정. D1/OL/WR과 동일 최우선.
+            fixed_n_blocks: {nurse_id: [[날짜2개], [날짜3개], ...]} 사용자 지정 N 고정. 각 블록은 연속 2일 또는 3일만 허용.
+        """
         logger.info("Model initializing...")
         self._create_variables()
+        if official_leave_days:
+            self._set_official_leave_days(official_leave_days)
+        if d1_days:
+            self._set_d1_days(d1_days)
         self._set_weekly_rest_days(weekly_rest_days)
         self._add_hard_constraints()
 
     def _add_hard_constraints(self):
-        """하드 제약조건 추가
-
-        주의: 주휴 설정(set_weekly_rest_days)은 이 메서드 호출 전에 먼저 수행되어야 합니다.
-        주휴는 최우선 조건으로 고정되며, 다른 제약보다 우선 적용됩니다.
-        """
-        # 하드 제약(H-xx)은 "반드시" 지켜야 합니다.
-        # 하드 제약을 하나라도 어기면 해(근무표)가 존재하지 않습니다.
-        # H-01: 일별 D/E/N 정원 준수
+        """반드시 지켜야 할 규칙(하드) + 되도록 지키면 좋은 규칙(소프트·점수) 넣기."""
         self._add_daily_quota_constraint()
 
-        # H-02: Night는 최대 3번 연속 가능
         self._add_night_block_constraint()
 
-        # H-03: N 블록 종료 후 연속 2일은 근무 금지(OFF/주휴만 가능)
         self._add_rest_after_night_constraint()
 
-        # H-04: 연속 5일 초과 연속근무 금지
         self._add_max_consecutive_work_constraint()
 
-        # # H-05: 근무 간 최소 16시간 휴식 (금지 전환: N→D, E→D)
         self._add_minimum_rest_constraint()
 
-        # (요청에 따라) H-07 관련(주휴 고정/주기 당김)은 여기서 제외
-        # 주휴 고정은 set_weekly_rest_days()를 사용자가 별도로 호출
-
-        # # 비근무일 관련 기준: 일주일(일~토) 안에 “주휴” 1개, “OFF” 1개 필수
-        # 7일마다 최소 O 1개, WR 1개 필수
         self._add_weekly_rest_and_off_constraint()
 
-        # 소프트 제약(S-xx)은 "가능하면" 만족하도록 점수화해서 최적화합니다.
-        # 이 코드는 목적함수(점수)를 설정하는 부분입니다.
-        # 목적함수
+        self._add_off_count_per_cycle_constraint()
+
         self._add_objective_maximize_work()
 
     def _add_daily_quota_constraint(self):
-        """H-01: 일별 D/E/N 정원 준수"""
-        # 매일 D/E/N이 "몇 명씩" 배치되어야 하는지(커버리지)를 강제합니다.
-        # required_*_per_day는 '정확히 몇 명'을 의미하도록 (==)로 넣어두었습니다.
+        """H-01: 매일 D/E/N이 정해진 인원만큼 꼭 들어가게 (정원 준수)."""
         for day in range(self.config.cycle_days):
-            # D 정원
             d_count = []
             for nurse in range(self.num_nurses):
                 d_count.append(self.model.NewBoolVar(f"d_nurse_{nurse}_day_{day}"))
@@ -205,8 +170,6 @@ class ScheduleModel:
                     self.assignments[nurse][day] != ShiftType.D
                 ).OnlyEnforceIf(d_count[nurse].Not())
 
-            # “정원 준수”는 상한(<=)이지만, 근무표가 전부 OFF로 가는 것을 막기 위해
-            # 기본적으로는 required_* 만큼 “필수 배치(==)”를 강제한다.
             self.model.Add(sum(d_count) <= self.config.max_d_per_day)
             self.model.Add(sum(d_count) == self.config.required_d_per_day)
 
@@ -224,7 +187,6 @@ class ScheduleModel:
             self.model.Add(sum(e_count) <= self.config.max_e_per_day)
             self.model.Add(sum(e_count) == self.config.required_e_per_day)
 
-            # N 정원
             n_count = []
             for nurse in range(self.num_nurses):
                 n_count.append(self.model.NewBoolVar(f"n_nurse_{nurse}_day_{day}"))
@@ -239,16 +201,9 @@ class ScheduleModel:
             self.model.Add(sum(n_count) == self.config.required_n_per_day)
 
     def _add_night_block_constraint(self):
-        """H-02: N은 최대 3번 연속 가능, 최소 2번 연속"""
-        # 핵심: 야간(N)은 2~3일 연속 블록으로만 존재해야 합니다.
-        # - 1일짜리 N은 금지
-        # - 4일 이상 연속 N도 금지
-        #
-        # 이를 위해 is_night[day]라는 보조 Bool 변수를 만들어
-        # "그날이 N인가?"를 0/1로 표현합니다.
+        """H-02: 나이트(N)는 2일 또는 3일 연속으로만 둔다. (1일만 N 금지, 4일 연속 N 금지)."""
         self.is_night = {}
         for nurse in range(self.num_nurses):
-            # 각 날짜가 N인지 여부
             is_night = [
                 self.model.NewBoolVar(f"is_night_nurse_{nurse}_day_{day}")
                 for day in range(self.config.cycle_days)
@@ -263,38 +218,23 @@ class ScheduleModel:
                     self.assignments[nurse][day] != ShiftType.N
                 ).OnlyEnforceIf(is_night[day].Not())
 
-            # 최대 3번 연속 N: 4일 이상 연속 N 금지
-            # 각 4일 연속 구간에서 최대 3개까지만 N이 될 수 있음
             for start_day in range(self.config.cycle_days - 3):
                 self.model.Add(sum(is_night[start_day + i] for i in range(4)) <= 3)
 
-            # 최소 2번 연속 N: N이 하루만 있는 경우 금지
-            # N이 배정되면 이전날 또는 다음날 중 최소 하나는 N이어야 함
             for day in range(self.config.cycle_days):
                 if day == 0:
-                    # 첫날: 다음날이 N이어야 함
                     self.model.AddImplication(is_night[day], is_night[day + 1])
                 elif day == self.config.cycle_days - 1:
-                    # 마지막날: 이전날이 N이어야 함
                     self.model.AddImplication(is_night[day], is_night[day - 1])
                 else:
-                    # 중간날: 이전날 또는 다음날 중 최소 하나는 N이어야 함
-                    # 즉, is_night[day]가 True이면 is_night[day-1] OR is_night[day+1]이 True
                     self.model.AddBoolOr(
                         [is_night[day - 1], is_night[day + 1]]
                     ).OnlyEnforceIf(is_night[day])
 
     def _add_rest_after_night_constraint(self):
-        """YLW Modified : start
-        H-03: N 블록 종료 후 연속 2일은 근무 금지 (OFF/WR/LH만 가능)
-        YLW Modified : end
-        """
-        # YLW Modified : start
-        # 야간(N) 블록이 끝난 직후에는 피로 회복을 위해 연속 2일은 "근무(D/E/N)" 금지
-        # 즉, (OFF, WR, LH 같은 비근무)만 허용합니다.
-        # YLW Modified : end
+        """H-03: N 블록이 끝난 뒤 2일은 근무 금지. 그 2일은 휴무(OFF) 또는 주휴(WR)만 가능.
+        허용 조합: OFF+OFF, OFF+WR, WR+OFF (WR+WR은 금지. 주당 WR 1회와 충돌 방지)."""
         for nurse in range(self.num_nurses):
-            # 각 날짜가 N인지 여부
             is_night = [
                 self.model.NewBoolVar(f"is_night_nurse_{nurse}_day_{day}")
                 for day in range(self.config.cycle_days)
@@ -308,9 +248,7 @@ class ScheduleModel:
                     self.assignments[nurse][day] != ShiftType.N
                 ).OnlyEnforceIf(is_night[day].Not())
 
-            # N 블록 종료 지점 찾기: N이었다가 다음날 N이 아닌 경우
             for day in range(self.config.cycle_days - self.config.rest_after_n_block):
-                # day가 N이고, day+1이 N이 아니면 day는 블록 종료일
                 block_end = self.model.NewBoolVar(
                     f"n_block_end_nurse_{nurse}_day_{day}"
                 )
@@ -323,26 +261,18 @@ class ScheduleModel:
                     [is_night[day].Not(), is_night[day + 1]]
                 ).OnlyEnforceIf(block_end.Not())
 
-                # YLW Modified : start
-                # 블록 종료 후 2일은 OFF, WR, 또는 LH만 가능 (근무 금지)
-                # YLW Modified : end
+                # N 직후 2일 중 최소 1일은 OFF (WR+WR 금지 → WR+OFF, OFF+OFF, OFF+WR만 허용)
+                rest_day_off_vars = []
                 for rest_day in range(1, self.config.rest_after_n_block + 1):
                     if day + rest_day < self.config.cycle_days:
                         rest_day_idx = day + rest_day
-                        # YLW Modified : start
-                        # 해당 날짜가 OFF, WR, 또는 LH인지 확인
-                        # YLW Modified : end
                         is_off = self.model.NewBoolVar(
                             f"is_off_nurse_{nurse}_day_{rest_day_idx}"
                         )
                         is_weekly_rest = self.model.NewBoolVar(
                             f"is_weekly_rest_nurse_{nurse}_day_{rest_day_idx}"
                         )
-                        # YLW Modified : start
-                        is_legal_holiday = self.model.NewBoolVar(
-                            f"is_legal_holiday_nurse_{nurse}_day_{rest_day_idx}"
-                        )
-                        # YLW Modified : end
+                        rest_day_off_vars.append(is_off)
 
                         self.model.Add(
                             self.assignments[nurse][rest_day_idx] == ShiftType.OFF
@@ -350,7 +280,6 @@ class ScheduleModel:
                         self.model.Add(
                             self.assignments[nurse][rest_day_idx] != ShiftType.OFF
                         ).OnlyEnforceIf(is_off.Not())
-
                         self.model.Add(
                             self.assignments[nurse][rest_day_idx] == ShiftType.WR
                         ).OnlyEnforceIf(is_weekly_rest)
@@ -358,46 +287,40 @@ class ScheduleModel:
                             self.assignments[nurse][rest_day_idx] != ShiftType.WR
                         ).OnlyEnforceIf(is_weekly_rest.Not())
 
-                        # YLW Modified : start
-                        self.model.Add(
-                            self.assignments[nurse][rest_day_idx] == ShiftType.LH
-                        ).OnlyEnforceIf(is_legal_holiday)
-                        self.model.Add(
-                            self.assignments[nurse][rest_day_idx] != ShiftType.LH
-                        ).OnlyEnforceIf(is_legal_holiday.Not())
-                        # YLW Modified : end
-
-                        # YLW Modified : start
-                        # block_end가 True이면 is_off OR is_weekly_rest OR is_legal_holiday이어야 함
-                        is_off_or_rest_or_lh = self.model.NewBoolVar(
-                            f"off_or_rest_or_lh_nurse_{nurse}_day_{rest_day_idx}"
+                        is_rest = self.model.NewBoolVar(
+                            f"rest_nurse_{nurse}_day_{rest_day_idx}"
                         )
-                        self.model.AddBoolOr(
-                            [is_off, is_weekly_rest, is_legal_holiday]
-                        ).OnlyEnforceIf(is_off_or_rest_or_lh)
+                        self.model.AddBoolOr([is_off, is_weekly_rest]).OnlyEnforceIf(
+                            is_rest
+                        )
                         self.model.AddBoolAnd(
-                            [is_off.Not(), is_weekly_rest.Not(), is_legal_holiday.Not()]
-                        ).OnlyEnforceIf(is_off_or_rest_or_lh.Not())
-                        self.model.AddImplication(block_end, is_off_or_rest_or_lh)
-                        # YLW Modified : end
+                            [is_off.Not(), is_weekly_rest.Not()]
+                        ).OnlyEnforceIf(is_rest.Not())
+                        self.model.AddImplication(block_end, is_rest)
+
+                # N 직후 2일이 모두 WR(WR+WR)이 되지 않도록: 최소 1일은 OFF
+                if rest_day_off_vars:
+                    self.model.AddBoolOr(rest_day_off_vars).OnlyEnforceIf(block_end)
+
+                if (nurse, day + 1) in self.official_leave_dates_set or (
+                    nurse,
+                    day + 2,
+                ) in self.official_leave_dates_set:
+                    self.model.Add(block_end == 0)
 
     def _add_max_consecutive_work_constraint(self):
-        """H-04: 6일 이상 연속 근무 금지 (최대 5일 연속 근무까지 허용)"""
-        # 어떤 6일 연속 구간에서도 "근무(D/E/N)"가 6번 모두 나오면 안 됩니다.
-        # 즉, 6일 중 최소 1일은 비근무(O/WR/...)여야 합니다.
-        # 구현: 6일 구간에서 근무일 합 <= 5
+        """H-04: 6일 연속 근무는 금지. (D/E/N/D1 모두 근무로 친다. 최대 5일까지 연속 가능.)"""
         for nurse in range(self.num_nurses):
-            # 각 날짜가 근무일인지 여부 (D/E/N은 근무, OFF/주휴는 비근무)
             is_work = [
                 self.model.NewBoolVar(f"is_work_nurse_{nurse}_day_{day}")
                 for day in range(self.config.cycle_days)
             ]
 
             for day in range(self.config.cycle_days):
-                # D, E, N 중 하나면 근무
                 is_d = self.model.NewBoolVar(f"is_d_nurse_{nurse}_day_{day}")
                 is_e = self.model.NewBoolVar(f"is_e_nurse_{nurse}_day_{day}")
                 is_n = self.model.NewBoolVar(f"is_n_nurse_{nurse}_day_{day}")
+                is_d1 = self.model.NewBoolVar(f"is_d1_nurse_{nurse}_day_{day}")
 
                 self.model.Add(
                     self.assignments[nurse][day] == ShiftType.D
@@ -420,40 +343,26 @@ class ScheduleModel:
                     self.assignments[nurse][day] != ShiftType.N
                 ).OnlyEnforceIf(is_n.Not())
 
-                # is_work = is_d OR is_e OR is_n
-                self.model.AddBoolOr([is_d, is_e, is_n]).OnlyEnforceIf(is_work[day])
+                self.model.Add(
+                    self.assignments[nurse][day] == ShiftType.D1
+                ).OnlyEnforceIf(is_d1)
+                self.model.Add(
+                    self.assignments[nurse][day] != ShiftType.D1
+                ).OnlyEnforceIf(is_d1.Not())
+
+                # is_work = is_d OR is_e OR is_n OR is_d1
+                self.model.AddBoolOr([is_d, is_e, is_n, is_d1]).OnlyEnforceIf(
+                    is_work[day]
+                )
                 self.model.AddBoolAnd(
-                    [is_d.Not(), is_e.Not(), is_n.Not()]
+                    [is_d.Not(), is_e.Not(), is_n.Not(), is_d1.Not()]
                 ).OnlyEnforceIf(is_work[day].Not())
 
-            # 6일 이상 연속 근무 금지: 어떤 6일 연속 구간에서도 최대 5일까지만 근무 가능
             for start_day in range(self.config.cycle_days - 5):
                 self.model.Add(sum(is_work[start_day + i] for i in range(6)) <= 5)
 
     def _add_objective_maximize_work(self):
-        """목적함수: S-01/S-02 소프트 제약(점수 최소화) 반영.
-        S-01: 개인별 D/E/N 개수 균형(평균 대비 편차 최소화)
-        S-02: 개인별 비근무일 개수 형평성(편차 최소화)
-        추가: O와 WR 연속성 보너스 (낮은 가중치)
-        """
-        # ============================================================
-        # 소프트 제약은 "점수"로 변환하여 Minimize(점수)합니다.
-        #
-        # (1) S-01 D/E/N 균형:
-        # - 각 간호사별 D/E/N 횟수가 평균에 가깝도록(편차 최소)
-        #
-        # (2) S-02 비근무(O+WR) 형평성:
-        # - 각 간호사별 비근무일 수가 평균에 가깝도록(편차 최소)
-        #
-        # (3) O/WR 연속성(낮은 가중치):
-        # - O가 연속(O→O), WR이 연속(WR→WR)으로 이어지면 "보너스"
-        # - 목적함수는 Minimize이므로, 보너스는 점수에서 '빼기(-)'로 반영
-        #
-        # 가중치 의미:
-        # - balance_shift(기본 5): D/E/N 균형을 얼마나 중요하게 볼지
-        # - balance_off(기본 5): 비근무 형평성을 얼마나 중요하게 볼지
-        # - consecutive_rest_bonus(기본 2): O/WR 연속성을 얼마나 중요하게 볼지 (낮게 설정)
-        # ============================================================
+        """소프트 제약: D/E/N 균형·휴무일 형평·휴무·주휴 연속 보너스를 점수로 넣어, 점수가 낮은 해를 고른다."""
         cycle = self.config.cycle_days
         n = self.num_nurses
         rd = self.config.required_d_per_day
@@ -463,7 +372,6 @@ class ScheduleModel:
         w_off = getattr(self.config, "balance_off", 5)
         w_consecutive = getattr(self.config, "consecutive_rest_bonus", 2)
 
-        # 목표 개수 (전체 일정이 정원으로 채워지므로 평균 = 목표)
         target_d = (rd * cycle) // n
         target_e = (re * cycle) // n
         target_n = (rn * cycle) // n
@@ -479,9 +387,9 @@ class ScheduleModel:
             is_non_work_list = []
             is_o_list = []
             is_wr_list = []
-            # YLW Modified : start
+            is_vac_list = []
             is_lh_list = []
-            # YLW Modified : end
+            is_ol_list = []
 
             for day in range(cycle):
                 is_d = self.model.NewBoolVar(f"obj_d_n{nurse}_d{day}")
@@ -489,9 +397,9 @@ class ScheduleModel:
                 is_n = self.model.NewBoolVar(f"obj_n_n{nurse}_d{day}")
                 is_o = self.model.NewBoolVar(f"obj_o_n{nurse}_d{day}")
                 is_wr = self.model.NewBoolVar(f"obj_wr_n{nurse}_d{day}")
-                # YLW Modified : start
+                is_vac = self.model.NewBoolVar(f"obj_vac_n{nurse}_d{day}")
                 is_lh = self.model.NewBoolVar(f"obj_lh_n{nurse}_d{day}")
-                # YLW Modified : end
+                is_ol = self.model.NewBoolVar(f"obj_ol_n{nurse}_d{day}")
 
                 self.model.Add(
                     self.assignments[nurse][day] == ShiftType.D
@@ -523,23 +431,32 @@ class ScheduleModel:
                 self.model.Add(
                     self.assignments[nurse][day] != ShiftType.WR
                 ).OnlyEnforceIf(is_wr.Not())
-                # YLW Modified : start
+                self.model.Add(
+                    self.assignments[nurse][day] == ShiftType.VAC
+                ).OnlyEnforceIf(is_vac)
+                self.model.Add(
+                    self.assignments[nurse][day] != ShiftType.VAC
+                ).OnlyEnforceIf(is_vac.Not())
                 self.model.Add(
                     self.assignments[nurse][day] == ShiftType.LH
                 ).OnlyEnforceIf(is_lh)
                 self.model.Add(
                     self.assignments[nurse][day] != ShiftType.LH
                 ).OnlyEnforceIf(is_lh.Not())
-                # YLW Modified : end
+                self.model.Add(
+                    self.assignments[nurse][day] == ShiftType.OL
+                ).OnlyEnforceIf(is_ol)
+                self.model.Add(
+                    self.assignments[nurse][day] != ShiftType.OL
+                ).OnlyEnforceIf(is_ol.Not())
 
-                # YLW Modified : start
-                # 비근무일: OFF, WR, LH 모두 포함
                 is_non_work = self.model.NewBoolVar(f"obj_non_work_n{nurse}_d{day}")
-                self.model.AddBoolOr([is_o, is_wr, is_lh]).OnlyEnforceIf(is_non_work)
+                self.model.AddBoolOr([is_o, is_wr, is_vac, is_lh, is_ol]).OnlyEnforceIf(
+                    is_non_work
+                )
                 self.model.AddBoolAnd(
-                    [is_o.Not(), is_wr.Not(), is_lh.Not()]
+                    [is_o.Not(), is_wr.Not(), is_vac.Not(), is_lh.Not(), is_ol.Not()]
                 ).OnlyEnforceIf(is_non_work.Not())
-                # YLW Modified : end
 
                 is_d_list.append(is_d)
                 is_e_list.append(is_e)
@@ -547,9 +464,9 @@ class ScheduleModel:
                 is_non_work_list.append(is_non_work)
                 is_o_list.append(is_o)
                 is_wr_list.append(is_wr)
-                # YLW Modified : start
+                is_vac_list.append(is_vac)
                 is_lh_list.append(is_lh)
-                # YLW Modified : end
+                is_ol_list.append(is_ol)
 
             count_d = self.model.NewIntVar(0, cycle, f"count_d_n{nurse}")
             count_e = self.model.NewIntVar(0, cycle, f"count_e_n{nurse}")
@@ -560,7 +477,6 @@ class ScheduleModel:
             self.model.Add(count_n == sum(is_n_list))
             self.model.Add(count_off == sum(is_non_work_list))
 
-            # S-01: 평균 대비 편차 (절대값) -> dev >= |count - target|
             dev_d = self.model.NewIntVar(0, cycle, f"dev_d_n{nurse}")
             dev_e = self.model.NewIntVar(0, cycle, f"dev_e_n{nurse}")
             dev_n = self.model.NewIntVar(0, cycle, f"dev_n_n{nurse}")
@@ -571,16 +487,12 @@ class ScheduleModel:
             self.model.Add(dev_n >= count_n - target_n)
             self.model.Add(dev_n >= target_n - count_n)
 
-            # S-02: 비근무일 개수 편차
             dev_off = self.model.NewIntVar(0, cycle, f"dev_off_n{nurse}")
             self.model.Add(dev_off >= count_off - target_off)
             self.model.Add(dev_off >= target_off - count_off)
 
-            # O와 WR 연속성 보너스: O→O, WR→WR 연속 전환에 보너스
-            # 연속 전환이 많을수록 더 긴 연속 블록 = 보너스 (페널티에서 빼기)
             consecutive_bonus = []
             for day in range(cycle - 1):
-                # O→O 연속
                 o_to_o = self.model.NewBoolVar(f"o_to_o_n{nurse}_d{day}")
                 self.model.AddBoolAnd(
                     [is_o_list[day], is_o_list[day + 1]]
@@ -589,8 +501,6 @@ class ScheduleModel:
                     [is_o_list[day].Not(), is_o_list[day + 1].Not()]
                 ).OnlyEnforceIf(o_to_o.Not())
                 consecutive_bonus.append(o_to_o)
-
-                # WR→WR 연속
                 wr_to_wr = self.model.NewBoolVar(f"wr_to_wr_n{nurse}_d{day}")
                 self.model.AddBoolAnd(
                     [is_wr_list[day], is_wr_list[day + 1]]
@@ -599,8 +509,6 @@ class ScheduleModel:
                     [is_wr_list[day].Not(), is_wr_list[day + 1].Not()]
                 ).OnlyEnforceIf(wr_to_wr.Not())
                 consecutive_bonus.append(wr_to_wr)
-
-            # 연속성 점수 (최대화하려면 페널티에서 빼기 = 보너스)
             consecutive_score = sum(consecutive_bonus)
 
             penalty_terms.append(
@@ -612,15 +520,14 @@ class ScheduleModel:
         self.model.Minimize(sum(penalty_terms))
 
     def _add_minimum_rest_constraint(self):
-        """H-05: 근무 간 최소 16시간 휴식 (N→D, E→D 금지)"""
-        # 인력 피로/수면시간을 고려해서 다음 전환을 금지합니다.
-        # - N 다음날 D 금지
-        # - E 다음날 D 금지
+        """H-05: N이나 E 다음날에는 D/D1 금지 (휴식 16시간 확보)."""
         for nurse in range(self.num_nurses):
             for day in range(self.config.cycle_days - 1):
-                # N 다음날 D 금지
                 is_n = self.model.NewBoolVar(f"is_n_nurse_{nurse}_day_{day}")
                 is_d_next = self.model.NewBoolVar(f"is_d_next_nurse_{nurse}_day_{day}")
+                is_d1_next = self.model.NewBoolVar(
+                    f"is_d1_next_nurse_{nurse}_day_{day}"
+                )
 
                 self.model.Add(
                     self.assignments[nurse][day] == ShiftType.N
@@ -636,10 +543,16 @@ class ScheduleModel:
                     self.assignments[nurse][day + 1] != ShiftType.D
                 ).OnlyEnforceIf(is_d_next.Not())
 
-                # N AND D_next는 동시에 True가 될 수 없음
-                self.model.AddBoolOr([is_n.Not(), is_d_next.Not()])
+                self.model.Add(
+                    self.assignments[nurse][day + 1] == ShiftType.D1
+                ).OnlyEnforceIf(is_d1_next)
+                self.model.Add(
+                    self.assignments[nurse][day + 1] != ShiftType.D1
+                ).OnlyEnforceIf(is_d1_next.Not())
 
-                # E 다음날 D 금지
+                self.model.AddBoolOr([is_n.Not(), is_d_next.Not()])
+                self.model.AddBoolOr([is_n.Not(), is_d1_next.Not()])
+
                 is_e = self.model.NewBoolVar(f"is_e_nurse_{nurse}_day_{day}")
                 self.model.Add(
                     self.assignments[nurse][day] == ShiftType.E
@@ -648,23 +561,12 @@ class ScheduleModel:
                     self.assignments[nurse][day] != ShiftType.E
                 ).OnlyEnforceIf(is_e.Not())
 
-                # E AND D_next는 동시에 True가 될 수 없음
                 self.model.AddBoolOr([is_e.Not(), is_d_next.Not()])
+                self.model.AddBoolOr([is_e.Not(), is_d1_next.Not()])
 
     def _add_weekly_rest_and_off_constraint(self):
-        """YLW Modified : start
-        7일마다 최소 O(휴무) 1개, WR(주휴) 1개 필수
-        LH는 O로 카운트됨
-        YLW Modified : end
-        """
-        # YLW Modified : start
-        # 각 간호사에 대해 "매 7일(1주)" 안에
-        # - WR(주휴) 최소 1개
-        # - O(휴무) 또는 LH(법휴) 최소 1개 (LH는 O로 카운트)
-        # 가 반드시 존재하도록 강제합니다.
-        #
-        # 주의: 마지막 주(주기가 7의 배수가 아닐 때)는 남은 날짜만 검사합니다.
-        # YLW Modified : end
+        """한 주기에서 일주일(7일) 동안 최소 WR 1개·OFF 1개를 반드시 지키게 함.
+        주당 WR 1·OFF 1이 최소 휴식 요건이며, 주기 내 OFF 개수 하한은 이 제약으로만 정해짐(상한은 _add_off_count_per_cycle_constraint)."""
         num_weeks = (self.config.cycle_days + 6) // 7
         for nurse in range(self.num_nurses):
             for week in range(num_weeks):
@@ -684,201 +586,184 @@ class ScheduleModel:
                         self.assignments[nurse][day] != ShiftType.WR
                     ).OnlyEnforceIf(is_weekly_rest.Not())
                     weekly_rest_count.append(is_weekly_rest)
-
-                # YLW Modified : start
-                # 해당 주에 휴무(O) 또는 법휴(LH) 개수 (LH는 O로 카운트)
-                # YLW Modified : end
                 off_count = []
                 for day in range(week_start, week_end):
                     is_off = self.model.NewBoolVar(
                         f"is_off_nurse_{nurse}_week_{week}_day_{day}"
                     )
-                    # YLW Modified : start
-                    is_legal_holiday = self.model.NewBoolVar(
-                        f"is_legal_holiday_nurse_{nurse}_week_{week}_day_{day}"
-                    )
-                    # YLW Modified : end
-
                     self.model.Add(
                         self.assignments[nurse][day] == ShiftType.OFF
                     ).OnlyEnforceIf(is_off)
                     self.model.Add(
                         self.assignments[nurse][day] != ShiftType.OFF
                     ).OnlyEnforceIf(is_off.Not())
-                    # YLW Modified : start
-                    self.model.Add(
-                        self.assignments[nurse][day] == ShiftType.LH
-                    ).OnlyEnforceIf(is_legal_holiday)
-                    self.model.Add(
-                        self.assignments[nurse][day] != ShiftType.LH
-                    ).OnlyEnforceIf(is_legal_holiday.Not())
-
-                    # OFF 또는 LH 중 하나를 카운트
-                    is_off_or_lh = self.model.NewBoolVar(
-                        f"is_off_or_lh_nurse_{nurse}_week_{week}_day_{day}"
-                    )
-                    self.model.AddBoolOr([is_off, is_legal_holiday]).OnlyEnforceIf(
-                        is_off_or_lh
-                    )
-                    self.model.AddBoolAnd(
-                        [is_off.Not(), is_legal_holiday.Not()]
-                    ).OnlyEnforceIf(is_off_or_lh.Not())
-                    off_count.append(is_off_or_lh)
-                    # YLW Modified : end
-
-                # 주휴 최소 1개 필수
+                    off_count.append(is_off)
                 self.model.Add(sum(weekly_rest_count) >= 1)
-
-                # YLW Modified : start
-                # 휴무(O) 또는 법휴(LH) 최소 1개 필수
-                # YLW Modified : end
                 self.model.Add(sum(off_count) >= 1)
 
+    def _add_off_count_per_cycle_constraint(self):
+        """한 주기(예: 28일) 동안 휴무(OFF)는 상한만 둠(최대 off_max_per_cycle일). 하한 없음.
+        OFF가 8 미만이어도 되므로, 정원 충족을 위해 솔버가 OFF 개수를 줄여 최적해를 찾을 수 있음.
+        주당 최소 WR 1·OFF 1은 _add_weekly_rest_and_off_constraint에서 보장."""
+        for nurse in range(self.num_nurses):
+            off_indicators = []
+            for day in range(self.config.cycle_days):
+                is_off = self.model.NewBoolVar(f"off_cycle_nurse_{nurse}_day_{day}")
+                self.model.Add(
+                    self.assignments[nurse][day] == ShiftType.OFF
+                ).OnlyEnforceIf(is_off)
+                self.model.Add(
+                    self.assignments[nurse][day] != ShiftType.OFF
+                ).OnlyEnforceIf(is_off.Not())
+                off_indicators.append(is_off)
+            self.model.Add(sum(off_indicators) <= self.config.off_max_per_cycle)
+
+    def _set_official_leave_days(self, official_leave_days: dict[int, list[str]]):
+        """지정한 (간호사, 날짜)를 공가(OL)로 고정. 주휴보다 먼저 적용."""
+        for nurse, date_list in official_leave_days.items():
+            if nurse < 0 or nurse >= self.num_nurses:
+                continue
+            for date_str in date_list:
+                day_idx = self._day_index_from_date(date_str)
+                if day_idx is None:
+                    continue
+                self.model.Add(self.assignments[nurse][day_idx] == ShiftType.OL)
+                self.official_leave_dates_set.add((nurse, day_idx))
+
+    def _set_d1_days(self, d1_days: dict[int, list[str]]):
+        """지정한 (간호사, 날짜)를 D1(사전 지정 근무)로 고정. D1은 근무일이지만 일별 정원에는 안 들어감."""
+        for nurse, date_list in d1_days.items():
+            if nurse < 0 or nurse >= self.num_nurses:
+                continue
+            for date_str in date_list:
+                day_idx = self._day_index_from_date(date_str)
+                if day_idx is None:
+                    continue
+                self.model.Add(self.assignments[nurse][day_idx] == ShiftType.D1)
+                self.d1_dates_set.add((nurse, day_idx))
+
     def _set_weekly_rest_days(self, weekly_rest_days: dict[int, int]):
-        """
-        H-07: 주휴 고정
-        간호사별 주휴 요일 설정 (최우선 조건 - 반드시 먼저 호출되어야 함)
-
-        주휴는 고정되며 다른 제약보다 우선 적용됩니다.
-        주기 규칙: 1주기는 지정된 요일, 2주기부터는 7일마다 -1씩 당김
-
-        Args:
-            weekly_rest_days: {nurse_id: day_of_week}
-                             day_of_week: 0=일요일, 1=월요일, ..., 6=토요일
-        """
+        """H-07: 간호사별 주휴 요일(0=일~6=토)에 따라 WR 고정. 1주차는 지정 요일, 2주차부터 7일마다 하루씩 당김. 공가/D1/고정 D·E·N 날은 WR 안 넣음.
+        공가/D1/고정 D·E·N과 겹쳐 WR을 넣지 못한 주는 해당 주 내 다른 날(공가·D1·고정 D/E/N 제외) 중 하루에 WR을 배정(floating WR)하여 7일마다 주휴 1개 조건을 충족."""
         self.weekly_rest_days = weekly_rest_days
-
-        # ============================================================
-        # 이 함수는 "주휴(WR)"를 미리 고정합니다.
-        # - weekly_rest_days는 {간호사ID: 요일(0~6)} 형태입니다.
-        # - 주기 규칙: 7일마다 주휴 요일이 하루씩 앞당겨집니다. (예: 월→일→토→…)
-        #
-        # 그리고 중요한 추가 규칙:
-        # - set_weekly_rest_days로 고정되지 않은 날에 "비근무"가 발생한다면,
-        #   그것은 WR이 아니라 O(휴무)로 표현되도록 강제합니다.
-        #   (즉, WR은 이 함수가 고정해 준 날짜에만 등장)
-        # ============================================================
-        # 주기 규칙: 1주기 고정, 2주기부터 7일마다 -1씩 당김 (월→일→토→…)
-        # week 0: day_of_week, week 1: day_of_week-1, week 2: day_of_week-2, ...
         num_weeks = (self.config.cycle_days + 6) // 7
-        weekly_rest_dates_set = set()  # 주휴로 설정된 (nurse, day) 집합
-
+        weekly_rest_dates_set = set()
+        floating_wr_weeks = (
+            set()
+        )  # (nurse, week): 이 주에 원래 WR일이 공가/D1이라 WR을 다른 날로 옮겨야 함
         for nurse, day_of_week in weekly_rest_days.items():
             for week in range(num_weeks):
-                # 해당 주의 주휴 요일 = (day_of_week - week) mod 7
                 rest_dow = (day_of_week - week) % 7
                 day_in_cycle = week * 7 + rest_dow
                 if day_in_cycle < self.config.cycle_days:
-                    # 해당 날짜는 주휴로 고정 (최우선 조건)
+                    if (nurse, day_in_cycle) in self.official_leave_dates_set:
+                        floating_wr_weeks.add((nurse, week))
+                        continue
+                    if (nurse, day_in_cycle) in self.d1_dates_set:
+                        floating_wr_weeks.add((nurse, week))
+                        continue
                     self.model.Add(
                         self.assignments[nurse][day_in_cycle] == ShiftType.WR
                     )
                     weekly_rest_dates_set.add((nurse, day_in_cycle))
+        # 공가/D1/고정 D·E·N으로 WR이 빠진 주에서 WR을 넣을 수 있는 날 = 그 주 내 공가·D1·고정 D/E/N이 아닌 모든 날
+        alternative_wr_allowed_set = set()
+        for nurse, week in floating_wr_weeks:
+            week_start = week * 7
+            week_end = min(week_start + 7, self.config.cycle_days)
+            for day in range(week_start, week_end):
+                if (nurse, day) in self.official_leave_dates_set:
+                    continue
+                if (nurse, day) in self.d1_dates_set:
+                    continue
+                alternative_wr_allowed_set.add((nurse, day))
 
-        # YLW Modified : start
-        # 주휴로 설정되지 않은 날 중 비근무일(D/E/N이 아닌 날)은 법정 공휴일이면 LH, 아니면 OFF로 설정
-        # YLW Modified : end
+        floating_wr_week_is_wr_vars = {}  # (nurse, week) -> [is_wr vars for days in that week]
+        for nurse, week in floating_wr_weeks:
+            floating_wr_week_is_wr_vars[(nurse, week)] = []
+
         for nurse in range(self.num_nurses):
             for day in range(self.config.cycle_days):
+                if (nurse, day) in self.official_leave_dates_set:
+                    continue
+                if (nurse, day) in self.d1_dates_set:
+                    continue
                 if (nurse, day) not in weekly_rest_dates_set:
-                    # YLW Modified : start
-                    # 핵심:
-                    # - 이 날은 WR(주휴)이 될 수 없습니다. (주휴는 고정된 날에만)
-                    # - 그럼에도 근무가 아닌 상태가 필요하다면:
-                    #   * 법정 공휴일이면 LH(법휴)
-                    #   * 법정 공휴일이 아니면 OFF(휴무)
-                    #
-                    # 따라서 가능한 값은 D/E/N/OFF/LH 중 하나이며,
-                    # D/E/N이 아니면 법정 공휴일 여부에 따라 OFF 또는 LH가 되도록 만듭니다.
-                    # 주휴가 아닌 날: D/E/N 중 하나이거나 OFF/LH여야 함 (WR 불가)
-                    # D/E/N이 아닌 경우 법정 공휴일이면 LH, 아니면 OFF로 강제
-                    # YLW Modified : end
+                    in_alt_wr = (nurse, day) in alternative_wr_allowed_set
+                    week = day // 7
                     is_d = self.model.NewBoolVar(f"non_wr_d_n{nurse}_d{day}")
                     is_e = self.model.NewBoolVar(f"non_wr_e_n{nurse}_d{day}")
                     is_n = self.model.NewBoolVar(f"non_wr_n_n{nurse}_d{day}")
-                    is_o = self.model.NewBoolVar(f"non_wr_o_n{nurse}_d{day}")
-                    # YLW Modified : start
-                    is_lh = self.model.NewBoolVar(f"non_wr_lh_n{nurse}_d{day}")
-                    # YLW Modified : end
-
                     self.model.Add(
                         self.assignments[nurse][day] == ShiftType.D
                     ).OnlyEnforceIf(is_d)
                     self.model.Add(
                         self.assignments[nurse][day] != ShiftType.D
                     ).OnlyEnforceIf(is_d.Not())
-
                     self.model.Add(
                         self.assignments[nurse][day] == ShiftType.E
                     ).OnlyEnforceIf(is_e)
                     self.model.Add(
                         self.assignments[nurse][day] != ShiftType.E
                     ).OnlyEnforceIf(is_e.Not())
-
                     self.model.Add(
                         self.assignments[nurse][day] == ShiftType.N
                     ).OnlyEnforceIf(is_n)
                     self.model.Add(
                         self.assignments[nurse][day] != ShiftType.N
                     ).OnlyEnforceIf(is_n.Not())
-
-                    self.model.Add(
-                        self.assignments[nurse][day] == ShiftType.OFF
-                    ).OnlyEnforceIf(is_o)
-                    self.model.Add(
-                        self.assignments[nurse][day] != ShiftType.OFF
-                    ).OnlyEnforceIf(is_o.Not())
-
-                    # YLW Modified : start
-                    self.model.Add(
-                        self.assignments[nurse][day] == ShiftType.LH
-                    ).OnlyEnforceIf(is_lh)
-                    self.model.Add(
-                        self.assignments[nurse][day] != ShiftType.LH
-                    ).OnlyEnforceIf(is_lh.Not())
-                    # YLW Modified : end
-
-                    # WR은 불가 (주휴가 아닌 날이므로)
-                    self.model.Add(self.assignments[nurse][day] != ShiftType.WR)
-
-                    # YLW Modified : start
-                    # D OR E OR N OR OFF OR LH 중 하나여야 함 (ExactlyOne)
-                    self.model.AddBoolOr([is_d, is_e, is_n, is_o, is_lh])
-                    # YLW Modified : end
-
-                    # YLW Modified : start
-                    # D/E/N이 모두 False이면 법정 공휴일 여부에 따라 LH 또는 OFF가 True여야 함
-                    # 즉: NOT(D OR E OR N) => (법정 공휴일이면 LH, 아니면 OFF)
-                    is_work = self.model.NewBoolVar(f"is_work_n{nurse}_d{day}")
-                    self.model.AddBoolOr([is_d, is_e, is_n]).OnlyEnforceIf(is_work)
-                    self.model.AddBoolAnd(
-                        [is_d.Not(), is_e.Not(), is_n.Not()]
-                    ).OnlyEnforceIf(is_work.Not())
-
-                    # 법정 공휴일 여부 확인
-                    is_legal_holiday_day = self._is_legal_holiday(day)
-
-                    if is_legal_holiday_day:
-                        # 법정 공휴일이면 LH로 강제
-                        self.model.AddImplication(is_work.Not(), is_lh)
-                        # OFF는 불가
-                        self.model.AddImplication(is_work.Not(), is_o.Not())
+                    if in_alt_wr:
+                        is_wr = self.model.NewBoolVar(f"alt_wr_n{nurse}_d{day}")
+                        self.model.Add(
+                            self.assignments[nurse][day] == ShiftType.WR
+                        ).OnlyEnforceIf(is_wr)
+                        self.model.Add(
+                            self.assignments[nurse][day] != ShiftType.WR
+                        ).OnlyEnforceIf(is_wr.Not())
+                        if (nurse, week) in floating_wr_week_is_wr_vars:
+                            floating_wr_week_is_wr_vars[(nurse, week)].append(is_wr)
                     else:
-                        # 법정 공휴일이 아니면 OFF로 강제
-                        self.model.AddImplication(is_work.Not(), is_o)
-                        # LH는 불가
-                        self.model.AddImplication(is_work.Not(), is_lh.Not())
-                    # YLW Modified : end
+                        self.model.Add(self.assignments[nurse][day] != ShiftType.WR)
 
-    def add_forbidden_assignments(self, forbidden: list[tuple[int, int, ShiftType]]):
-        """
-        지정 근무 불가 제약 추가 (H-06)
+                    if self._is_legal_holiday(day):
+                        is_lh = self.model.NewBoolVar(f"non_wr_lh_n{nurse}_d{day}")
+                        self.model.Add(
+                            self.assignments[nurse][day] == ShiftType.LH
+                        ).OnlyEnforceIf(is_lh)
+                        self.model.Add(
+                            self.assignments[nurse][day] != ShiftType.LH
+                        ).OnlyEnforceIf(is_lh.Not())
+                        if in_alt_wr:
+                            self.model.AddExactlyOne([is_d, is_e, is_n, is_lh, is_wr])
+                        else:
+                            self.model.AddExactlyOne([is_d, is_e, is_n, is_lh])
+                    else:
+                        is_o = self.model.NewBoolVar(f"non_wr_o_n{nurse}_d{day}")
+                        is_vac = self.model.NewBoolVar(f"non_wr_vac_n{nurse}_d{day}")
+                        self.model.Add(
+                            self.assignments[nurse][day] == ShiftType.OFF
+                        ).OnlyEnforceIf(is_o)
+                        self.model.Add(
+                            self.assignments[nurse][day] != ShiftType.OFF
+                        ).OnlyEnforceIf(is_o.Not())
+                        self.model.Add(
+                            self.assignments[nurse][day] == ShiftType.VAC
+                        ).OnlyEnforceIf(is_vac)
+                        self.model.Add(
+                            self.assignments[nurse][day] != ShiftType.VAC
+                        ).OnlyEnforceIf(is_vac.Not())
 
-        Args:
-            forbidden: [(nurse_id, day, shift_type), ...] 리스트
-        """
-        for nurse, day, shift_type in forbidden:
-            self.model.Add(self.assignments[nurse][day] != shift_type)
+                        if in_alt_wr:
+                            self.model.AddExactlyOne(
+                                [is_d, is_e, is_n, is_o, is_vac, is_wr]
+                            )
+                        else:
+                            self.model.AddExactlyOne([is_d, is_e, is_n, is_o, is_vac])
+
+        for nurse, week in floating_wr_weeks:
+            vars_list = floating_wr_week_is_wr_vars.get((nurse, week), [])
+            if vars_list:
+                self.model.Add(sum(vars_list) == 1)
 
     def solve(
         self, time_limit_seconds: int = 30
